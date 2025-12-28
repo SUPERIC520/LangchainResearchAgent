@@ -1,15 +1,20 @@
 import os
+from typing import TypedDict, Annotated, List, Union
 from dotenv import load_dotenv
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_tavily import TavilySearch
 from langchain.agents import create_agent
 from langchain_core.tools import tool 
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.memory import MemorySaver
+import operator
 
-# 1. LOAD SECRETS
+# --- LOAD SECRETS ---
 load_dotenv()
 
-# 2. TOOLS
+# --- TOOLS ---
 @tool
 def save_markdown_file(content: str, filename: str):
     """
@@ -26,76 +31,124 @@ def save_markdown_file(content: str, filename: str):
 
 search_tool = TavilySearch(max_results=2)
 
-tools = [
-    search_tool,
-    save_markdown_file
-]
 
-# 3. MODEL
+# --- MODEL ---
 llm = ChatGoogleGenerativeAI(
     model="gemini-pro-latest",
     temperature=0
 )
 
-memory = MemorySaver()
 
-# 4. DEFINE SYSTEM PROMPT
-system_prompt = """You are a Senior Research Analyst.
-Follow this loop:
-1. Plan: Analyze the user's request.
-2. Act: Use search tools to gather data.
-3. Observe: Read the results.
-4. Repeat: If you need more info, search again.
-5. Finalize: Save the summary to a file ONLY when you have a complete answer.
-"""
+# --- AGENTS ---
+researcher_tools = [
+    search_tool,
+    save_markdown_file
+]
 
-# 5. AGENT
-# This creates a compiled graph automatically. No more "AgentExecutor" needed.
-agent_graph = create_agent(
+researcher_memory = MemorySaver()
+
+researcher_prompt = """You are a thorough researcher. 
+Do not stop until you have concrete numbers/facts. 
+If you receive feedback from the Critic, strictly follow their advice to improve your search."""
+
+researcher_agent = create_agent(
     llm, 
-    tools=tools, 
-    system_prompt=system_prompt,
-    checkpointer=memory)
+    tools=researcher_tools, 
+    system_prompt=researcher_prompt,
+    checkpointer=researcher_memory)
 
-# 6. RUN WITH EXPLICIT LOGS
-def run_agent_with_logs(query, thread_id="1"):
-    print(f"\nExample Task: {query}")
-    print("--- STARTING AGENT LOOP ---\n")
+# --- NODES ---
+def researcher_node(state):
+    # This invokes the ReAct agent. It returns a dictionary with the new messages.
+    return researcher_agent.invoke(state)
+
+# Node 2: The Critic (The New Guardrail)
+def critic_node(state):
+    messages = state["messages"]
+    last_message = messages[-1]
     
-    # Config tells the memory which "conversation thread" this is
-    config = {"configurable": {"thread_id": thread_id}}
+    # We ask the LLM to play the role of a QA Manager
+    critique_prompt = f"""
+    You are a strict Quality Assurance Manager. 
+    Review the Researcher's latest response:
     
-    # We use .stream() instead of .invoke() to see the steps
-    inputs = {"messages": [("user", query)]}
+    "{last_message.content}"
     
-    # This loop prints the "Thinking..." process
-    for step in agent_graph.stream(inputs, config, stream_mode="values"):
-        # The 'step' contains the current state of messages
-        last_message = step["messages"][-1]
-        
-        # If the last message is from the AI, it's a Thought or a Tool Call
-        if last_message.type == "ai":
-            if last_message.tool_calls:
-                print(f"🛠️  PLAN: Agent decided to call tool: {last_message.tool_calls[0]['name']}")
-            else:
-                # CLEAN UP GOOGLE'S RAW OUTPUT
-                content = last_message.content
-                if isinstance(content, list):
-                    # Extract just the text part from the list
-                    content = " ".join([part.get("text", "") for part in content if "text" in part])
-                
-                print(f"🤖 THINKING: {content}")
-        
-        # If the last message is a ToolMessage, it's the Observation
-        elif last_message.type == "tool":
-            print(f"👀 OBSERVE: Tool output received ({len(last_message.content)} chars)")
+    Check for:
+    1. Is the answer detailed and backed by facts?
+    2. Did they actually use the file tool if requested?
+    3. Is the tone professional?
+    
+    If it is GOOD, respond with exactly: "APPROVED"
+    If it is BAD, respond with "RETRY: " followed by specific instructions on what to fix.
+    """
+    
+    response = llm.invoke([HumanMessage(content=critique_prompt)])
+    
+    # We return the critic's response as a standard AIMessage
+    # We tag it so we can spot it in logs easily
+    return {"messages": [AIMessage(content=response.content, name="critic")]}
 
-    print("\n--- AGENT FINISHED ---")
+# --- CONDITIONAL LOGIC (The Router) ---
+def should_continue(state):
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    # If the Critic says APPROVED, we finish.
+    if "APPROVED" in last_message.content:
+        return END
+    
+    # Otherwise, loop back to the researcher to try again.
+    return "researcher"
 
-# First Run
-run_agent_with_logs("Find the release date of GPT-4o and write it to gpt_dates.md")
+# --- GRAPH CONSTRUCTION ---
+# We use a MessageState (standard list of messages)
+class AgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], operator.add]
 
-# Second Run (Testing Memory)
-# We ask a follow-up question. The agent should remember the previous context.
-print("\n\n--- TESTING MEMORY (New Turn) ---")
-run_agent_with_logs("What date did I just ask you about?", thread_id="1")
+builder = StateGraph(AgentState)
+
+builder.add_node("researcher", researcher_node)
+builder.add_node("critic", critic_node)
+
+# Flow: Start -> Researcher -> Critic -> Check -> (Loop or End)
+builder.add_edge(START, "researcher")
+builder.add_edge("researcher", "critic")
+
+builder.add_conditional_edges(
+    "critic",
+    should_continue,
+    {
+        "researcher": "researcher",
+        END: END
+    }
+)
+
+# Compile with memory and a safety limit (max 10 steps to prevent infinite loops)
+memory = MemorySaver()
+graph = builder.compile(checkpointer=memory)
+
+# --- RUNNER ---
+def run_week3_agent(query):
+    print(f"\n🚀 STARTING TASK: {query}")
+    print(f"---" * 10)
+    
+    inputs = {"messages": [HumanMessage(content=query)]}
+    config = {"configurable": {"thread_id": "week3_test_1"}, "recursion_limit": 15}
+
+    for step in graph.stream(inputs, config):
+        for key, value in step.items():
+            # 'key' is the name of the node (researcher or critic)
+            last_msg = value["messages"][-1]
+            
+            if key == "critic":
+                print(f"\n👨‍⚖️ CRITIC: {last_msg.content}")
+                print(f"---" * 5)
+            elif key == "researcher":
+                # Only print the text content to keep it clean
+                if hasattr(last_msg, "content") and last_msg.content:
+                    print(f"🤖 RESEARCHER: {last_msg.content[:150]}...")
+
+# Run the Test
+# We use a vague prompt to force the Critic to trigger a retry
+run_week3_agent("Find info on the new battery tech.")
