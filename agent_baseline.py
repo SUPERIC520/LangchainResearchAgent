@@ -5,6 +5,7 @@ from langchain_tavily import TavilySearch
 from langchain.agents import create_agent
 from langchain_core.tools import tool 
 from langgraph.checkpoint.memory import MemorySaver
+from agent.tools import arxiv_search_papers
 
 # 1. LOAD SECRETS
 load_dotenv()
@@ -27,6 +28,7 @@ def save_markdown_file(content: str, filename: str):
 search_tool = TavilySearch(max_results=2)
 
 tools = [
+    arxiv_search_papers,
     search_tool,
     save_markdown_file
 ]
@@ -56,6 +58,28 @@ agent_graph = create_agent(
     tools=tools, 
     system_prompt=system_prompt,
     checkpointer=memory)
+
+def run_baseline(query: str, output_md: str, thread_id="baseline-1"):
+    config = {"configurable": {"thread_id": thread_id}}
+    inputs = {"messages": [("user", query)]}
+
+    final_text = ""
+
+    for step in agent_graph.stream(inputs, config, stream_mode="values"):
+        last_message = step["messages"][-1]
+
+        if last_message.type == "ai" and not last_message.tool_calls:
+            content = last_message.content
+            if isinstance(content, list):
+                content = " ".join([part.get("text", "") for part in content if "text" in part])
+            # keep updating; last non-empty AI message wins
+            if content and str(content).strip():
+                final_text = str(content).strip()
+
+    # save
+    save_markdown_file.invoke({"content": final_text, "filename": output_md})
+    return {"final": final_text}
+
 
 # 6. RUN WITH EXPLICIT LOGS
 def run_agent_with_logs(query, thread_id="1"):
