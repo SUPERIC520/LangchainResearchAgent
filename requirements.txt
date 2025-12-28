@@ -6,4 +6,6 @@ langchain-tavily
 openai
 google-generativeai
 
+arxiv
+
 python-dotenv
